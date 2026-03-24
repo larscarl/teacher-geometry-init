@@ -29,3 +29,6 @@ experiments/results_distill.jsonl
 experiments/submissions_distill.jsonl
 experiments/smoke/
 experiments/smoke_cache/
+
+# Local historical registry (kept locally, not synced)
+experiments/registry_distill_deprecated.csv
