@@ -1,0 +1,18 @@
+[project]
+name = "teacher-geometry-init"
+version = "0.1.0"
+description = "modular framework for distilling width-compressed autoregressive language models with teacher-guided initialization"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.7.0",
+    "datasets>=4.0.0",
+    "numpy==2.1.2",
+    "scikit-learn>=1.7.0",
+    "torch",
+    "tqdm",
+    "transformers",
+    "umap-learn>=0.5.9.post2",
+]
+
+[project.urls]  
+Repository = "https://github.com/larscarl/teacher-geometry-init.git"

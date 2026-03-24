@@ -1,0 +1,53 @@
+#!/bin/bash
+# Slurm resources are intentionally provided via `sbatch ...` CLI
+# (e.g. experiments/registry_distill.csv -> `sbatch_args`).
+#SBATCH --account=cai_nlp
+#SBATCH --output=/cluster/home/shmr/llm_compression/logs/%j_%N__%x.out
+#SBATCH --error=/cluster/home/shmr/llm_compression/logs/%j_%N__%x.err
+
+export LMIC_LOGLEVEL="INFO"
+
+# Resolve repository root from this script location.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Load .env from repository root (e.g. CODE_DIRECTORY, HF_TOKEN).
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${REPO_ROOT}/.env"
+  set +a
+fi
+
+# CODE_DIRECTORY can be set in .env. Fall back to repo root.
+CODE_DIRECTORY="${CODE_DIRECTORY:-${REPO_ROOT}}"
+cd "$CODE_DIRECTORY"
+
+# Bootstrap on the compute node (same project workflow as other submit scripts)
+source cluster/env_bootstrap.sh
+
+# Load project env if present (e.g. BASE_DIR, PROJECT_NAME for VT2 layout).
+if [[ -f "${CODE_DIRECTORY}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${CODE_DIRECTORY}/.env"
+  set +a
+fi
+
+# Resolve storage roots safely under `set -u`.
+BASE_DIR_RESOLVED="${BASE_DIR:-/cluster/projects/LMIC}"
+PROJECT_NAME_RESOLVED="${PROJECT_NAME:-llm_compression}"
+
+# Store large run artifacts on project storage (not home filesystem).
+DISTILL_RUN_DIR_BASE="${BASE_DIR_RESOLVED}/${PROJECT_NAME_RESOLVED}/distillation/runs_v2"
+# Keep lightweight run index in the code repository.
+DISTILL_RESULTS_PATH="${CODE_DIRECTORY}/experiments/results_distill.jsonl"
+
+# Forward all Hydra-style overrides from sbatch CLI.
+uv run python -m src.distillation.run_distill \
+  --run-dir-base="${DISTILL_RUN_DIR_BASE}" \
+  --results-path="${DISTILL_RESULTS_PATH}" \
+  --log-level="${LMIC_LOGLEVEL:-INFO}" \
+  "$@"
+
+echo "=== distillation run completed ===" >&2
