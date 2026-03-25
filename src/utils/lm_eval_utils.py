@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -14,6 +15,21 @@ SENSITIVE_KEYS = {
     "auth_token",
     "authorization",
 }
+
+
+def _ensure_hf_auth_env(hf_token: str) -> None:
+    token = str(hf_token or "").strip()
+    if not token:
+        return
+
+    # Keep auth in environment so lm-eval/huggingface_hub can access gated assets
+    # without embedding credentials into logged model_args payloads.
+    if not os.environ.get("HF_TOKEN"):
+        os.environ["HF_TOKEN"] = token
+    if not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+    if not os.environ.get("HUGGINGFACE_HUB_TOKEN"):
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = token
 
 
 def parse_task_list(text: str) -> List[str]:
@@ -89,11 +105,11 @@ def run_lm_eval(
             "(dependency: lm-eval[hf])."
         ) from exc
 
+    _ensure_hf_auth_env(hf_token)
+
     model_args: Dict[str, Any] = {
         "pretrained": str(model_ref),
     }
-    if hf_token:
-        model_args["token"] = hf_token
     if trust_remote_code is not None:
         model_args["trust_remote_code"] = bool(trust_remote_code)
 

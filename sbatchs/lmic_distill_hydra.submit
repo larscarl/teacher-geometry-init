@@ -53,7 +53,7 @@ BASE_DIR_RESOLVED="${BASE_DIR:-/cluster/projects/LMIC}"
 PROJECT_NAME_RESOLVED="${PROJECT_NAME:-llm_compression}"
 
 # Store large run artifacts on project storage (not home filesystem).
-DISTILL_RUN_DIR_BASE="${BASE_DIR_RESOLVED}/${PROJECT_NAME_RESOLVED}/distillation/runs_v2"
+DISTILL_RUN_DIR_BASE="${BASE_DIR_RESOLVED}/${PROJECT_NAME_RESOLVED}/distillation/"
 # Keep lightweight run index in the code repository.
 DISTILL_RESULTS_PATH="${CODE_DIRECTORY}/experiments/results_distill.jsonl"
 
