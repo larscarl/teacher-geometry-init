@@ -24,12 +24,13 @@ dist/
 .DS_Store
 
 # Distillation outputs
+experiments/cluster/
+experiments/lm_eval_results.jsonl
 experiments/runs_distill/
 experiments/results_distill.jsonl
-experiments/submissions_distill.jsonl
-experiments/lm_eval_results.jsonl
 experiments/smoke/
 experiments/smoke_cache/
+experiments/submissions_distill.jsonl
 
 # Weights & Biases outputs
 wandb/
