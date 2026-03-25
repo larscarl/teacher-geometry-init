@@ -64,6 +64,7 @@ uv run python -m src.experiments.distill_registry run \
 
 Duplicate safeguard (default):
 - `run` now fails if `run_artifact_id` was already used (detected via `experiments/submissions_distill.jsonl`, `experiments/results_distill.jsonl`, or an existing artifact directory).
+- `src.distillation.run_distill` now also fails fast when `run.mode=new` and the target `run_dir` is non-empty, unless `run.force_clear=true` is explicitly set.
 
 Intentional rerun of the same config with separate folder:
 

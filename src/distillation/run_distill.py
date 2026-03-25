@@ -1602,11 +1602,6 @@ def _run_training(
     if mode not in {"auto", "new", "resume"}:
         raise ValueError(f"Unsupported run.mode={mode!r}. Use auto|new|resume.")
 
-    if mode == "new" and _parse_bool(
-        _get_first(overrides, ["run.force_clear"], default=""), default=False
-    ):
-        _clear_dir_contents(run_dir)
-
     if mode == "new":
         resume_ckpt = None
     else:
@@ -1726,6 +1721,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     run_dir = Path(args.run_dir_base) / artifact_id
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    requested_mode = _get_first(overrides, ["run.mode"], default="new").lower()
+    force_clear = _parse_bool(
+        _get_first(overrides, ["run.force_clear"], default=""), default=False
+    )
+    if requested_mode == "new":
+        run_dir_has_contents = any(run_dir.iterdir())
+        if run_dir_has_contents:
+            if force_clear:
+                _clear_dir_contents(run_dir)
+            else:
+                raise RuntimeError(
+                    "run.mode=new but target run_dir is not empty: "
+                    f"{run_dir}. Use a unique run_artifact_id, "
+                    "set run.mode=resume/auto, or set run.force_clear=true."
+                )
 
     log = setup_logging("run_distill", level=args.log_level)
     log_path = run_dir / "run_distill.log"
