@@ -31,6 +31,7 @@ Notes:
 - `HF_TOKEN` is read from environment by `run_distill.py` and is also loaded from `.env`.
 - `CODE_DIRECTORY` is used by `sbatchs/lmic_distill_hydra.submit` (for cluster runs).
 - W&B logging is opt-in. Enable it with `WANDB_ENABLED=true` or `wandb.enabled=true` in overrides.
+- Cluster bootstrap (`cluster/env_bootstrap.sh`) installs from `pyproject.toml`/`uv.lock` via `uv sync` (no manual `uv pip install` needed).
 
 ## Registry Files
 
