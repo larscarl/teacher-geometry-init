@@ -9,7 +9,9 @@ export LMIC_LOGLEVEL="INFO"
 
 # Resolve repository root from this script location.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "SCRIPT_DIR=$SCRIPT_DIR"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+echo "REPO_ROOT=$REPO_ROOT"
 
 # Load .env from repository root (e.g. CODE_DIRECTORY, HF_TOKEN).
 if [[ -f "${REPO_ROOT}/.env" ]]; then
@@ -21,6 +23,7 @@ fi
 
 # CODE_DIRECTORY can be set in .env. Fall back to repo root.
 CODE_DIRECTORY="${CODE_DIRECTORY:-${REPO_ROOT}}"
+echo "CODE_DIRECTORY=$CODE_DIRECTORY"
 cd "$CODE_DIRECTORY"
 
 # Bootstrap on the compute node (same project workflow as other submit scripts)
