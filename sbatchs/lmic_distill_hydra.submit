@@ -1,17 +1,17 @@
 #!/bin/bash
+set -euo pipefail
+
 # Slurm resources are intentionally provided via `sbatch ...` CLI
 # (e.g. experiments/registry_distill.csv -> `sbatch_args`).
 #SBATCH --account=cai_nlp
 #SBATCH --output=logs/%j_%N__%x.out
 #SBATCH --error=logs/%j_%N__%x.err
 
-export LMIC_LOGLEVEL="INFO"
+export LMIC_LOGLEVEL="${LMIC_LOGLEVEL:-INFO}"
 
-# Resolve repository root from this script location.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "SCRIPT_DIR=$SCRIPT_DIR"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-echo "REPO_ROOT=$REPO_ROOT"
+# Slurm executes a temporary copy of this script from a spool directory.
+# Use the submission directory to locate the repository and its `.env`.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
 
 # Load .env from repository root (e.g. CODE_DIRECTORY, HF_TOKEN).
 if [[ -f "${REPO_ROOT}/.env" ]]; then
@@ -23,11 +23,22 @@ fi
 
 # CODE_DIRECTORY can be set in .env. Fall back to repo root.
 CODE_DIRECTORY="${CODE_DIRECTORY:-${REPO_ROOT}}"
-echo "CODE_DIRECTORY=$CODE_DIRECTORY"
+if [[ "${CODE_DIRECTORY}" != /* ]]; then
+  CODE_DIRECTORY="${REPO_ROOT}/${CODE_DIRECTORY}"
+fi
+if [[ ! -d "${CODE_DIRECTORY}" ]]; then
+  echo "ERROR: CODE_DIRECTORY does not exist: ${CODE_DIRECTORY}" >&2
+  exit 1
+fi
 cd "$CODE_DIRECTORY"
 
 # Bootstrap on the compute node (same project workflow as other submit scripts)
-source cluster/env_bootstrap.sh
+if [[ ! -f "${CODE_DIRECTORY}/cluster/env_bootstrap.sh" ]]; then
+  echo "ERROR: Missing bootstrap script: ${CODE_DIRECTORY}/cluster/env_bootstrap.sh" >&2
+  exit 1
+fi
+# shellcheck disable=SC1091
+source "${CODE_DIRECTORY}/cluster/env_bootstrap.sh"
 
 # Load project env if present (e.g. BASE_DIR, PROJECT_NAME for VT2 layout).
 if [[ -f "${CODE_DIRECTORY}/.env" ]]; then
