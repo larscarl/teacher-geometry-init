@@ -34,5 +34,9 @@ experiments/smoke_cache/
 # Weights & Biases outputs
 wandb/
 
+# Scheduler logs
+logs/*
+!logs/.gitkeep
+
 # Local historical registry (kept locally, not synced)
 experiments/registry_distill_deprecated.csv

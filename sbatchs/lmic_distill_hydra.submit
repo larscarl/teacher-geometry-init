@@ -2,8 +2,8 @@
 # Slurm resources are intentionally provided via `sbatch ...` CLI
 # (e.g. experiments/registry_distill.csv -> `sbatch_args`).
 #SBATCH --account=cai_nlp
-#SBATCH --output=/cluster/home/shmr/llm_compression/logs/%j_%N__%x.out
-#SBATCH --error=/cluster/home/shmr/llm_compression/logs/%j_%N__%x.err
+#SBATCH --output=logs/%j_%N__%x.out
+#SBATCH --error=logs/%j_%N__%x.err
 
 export LMIC_LOGLEVEL="INFO"
 
