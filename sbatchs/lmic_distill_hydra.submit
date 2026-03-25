@@ -1,11 +1,11 @@
 #!/bin/bash
-set -euo pipefail
-
 # Slurm resources are intentionally provided via `sbatch ...` CLI
 # (e.g. experiments/registry_distill.csv -> `sbatch_args`).
 #SBATCH --account=cai_nlp
 #SBATCH --output=logs/%j_%N__%x.out
 #SBATCH --error=logs/%j_%N__%x.err
+
+set -euo pipefail
 
 export LMIC_LOGLEVEL="${LMIC_LOGLEVEL:-INFO}"
 
