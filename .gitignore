@@ -27,8 +27,12 @@ dist/
 experiments/runs_distill/
 experiments/results_distill.jsonl
 experiments/submissions_distill.jsonl
+experiments/lm_eval_results.jsonl
 experiments/smoke/
 experiments/smoke_cache/
+
+# Weights & Biases outputs
+wandb/
 
 # Local historical registry (kept locally, not synced)
 experiments/registry_distill_deprecated.csv

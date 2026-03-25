@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import inspect
 import json
 import logging
@@ -9,7 +10,7 @@ import shutil
 import socket
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
@@ -19,17 +20,29 @@ from transformers import (
     AutoTokenizer,
     DataCollatorForLanguageModeling,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 from transformers.trainer_utils import get_last_checkpoint
 
 from src.distillation.kld_loss_trainer import KLDistillationTrainer
 from src.distillation.student_factory import create_student_model
-from src.utils.helper import setup_logging
+from src.utils.helper import is_rank0, setup_logging
+from src.utils.lm_eval_utils import (
+    append_jsonl as append_jsonl_safe,
+    flatten_lm_eval_scalars,
+    make_json_safe,
+    parse_batch_size,
+    parse_limit,
+    parse_task_list,
+    redact_lm_eval_result,
+    run_lm_eval,
+)
 
 
 DEFAULT_RESULTS_PATH = "experiments/results_distill.jsonl"
 DEFAULT_RUN_DIR_BASE = "experiments/runs_distill"
+LM_EVAL_RESULTS_FILENAME = "LM_EVAL_RESULTS.jsonl"
 
 
 def _load_env_file(path: Path, *, override: bool = False) -> None:
@@ -118,6 +131,13 @@ def _parse_bool(value: Optional[str], default: bool) -> bool:
     return default
 
 
+def _parse_optional_bool(value: Optional[str]) -> Optional[bool]:
+    text = _strip(value)
+    if not text:
+        return None
+    return _parse_bool(text, default=False)
+
+
 def _parse_overrides(tokens: List[str]) -> Dict[str, str]:
     """
     Parse Hydra-like CLI overrides passed as plain tokens, e.g.:
@@ -141,6 +161,257 @@ def _get_first(overrides: Dict[str, str], keys: List[str], default: str = "") ->
         if value:
             return value
     return default
+
+
+def _parse_list(value: Optional[str]) -> List[str]:
+    return parse_task_list(value or "")
+
+
+def _resolve_wandb_settings(
+    overrides: Dict[str, str],
+    *,
+    run_name: str,
+    run_dir: Path,
+) -> Dict[str, object]:
+    enabled_raw = _get_first(
+        overrides,
+        ["wandb.enabled", "logging.wandb", "wandb", "log.wandb"],
+        default="",
+    )
+    enabled_env = os.environ.get("WANDB_ENABLED", "")
+    enabled = _parse_bool(enabled_raw, _parse_bool(enabled_env, False))
+
+    project = _get_first(
+        overrides,
+        ["wandb.project", "wandb_project", "logging.wandb_project"],
+        default=os.environ.get("WANDB_PROJECT", "teacher-geometry-init"),
+    )
+    entity = _get_first(
+        overrides,
+        ["wandb.entity", "wandb_entity", "logging.wandb_entity"],
+        default=os.environ.get("WANDB_ENTITY", ""),
+    )
+    group = _get_first(
+        overrides,
+        ["wandb.group", "wandb_group"],
+        default=os.environ.get("WANDB_GROUP", ""),
+    )
+    tags = _parse_list(
+        _get_first(
+            overrides,
+            ["wandb.tags", "wandb_tags"],
+            default=os.environ.get("WANDB_TAGS", ""),
+        )
+    )
+    mode = _get_first(
+        overrides,
+        ["wandb.mode", "wandb_mode"],
+        default=os.environ.get("WANDB_MODE", ""),
+    )
+    wandb_dir = _get_first(
+        overrides,
+        ["wandb.dir", "wandb_dir"],
+        default=os.environ.get("WANDB_DIR", ""),
+    )
+
+    name = _get_first(
+        overrides,
+        ["wandb.name", "wandb_name"],
+        default=run_name,
+    )
+
+    return {
+        "enabled": enabled,
+        "project": project,
+        "entity": entity,
+        "group": group,
+        "tags": tags,
+        "mode": mode,
+        "dir": wandb_dir or str(run_dir),
+        "name": name,
+    }
+
+
+def _maybe_init_wandb(
+    settings: Dict[str, object],
+    *,
+    overrides: Dict[str, str],
+    log: logging.Logger,
+) -> Optional[object]:
+    if not settings.get("enabled"):
+        return None
+    if not is_rank0():
+        return None
+    if importlib.util.find_spec("wandb") is None:
+        raise RuntimeError("wandb is enabled but not installed. Add it to dependencies.")
+
+    import wandb
+
+    mode = str(settings.get("mode") or "").strip()
+    if mode:
+        os.environ["WANDB_MODE"] = mode
+
+    wandb_dir = str(settings.get("dir") or "").strip()
+    if wandb_dir:
+        os.environ["WANDB_DIR"] = wandb_dir
+
+    run = wandb.init(
+        project=str(settings.get("project") or "teacher-geometry-init"),
+        entity=str(settings.get("entity") or "") or None,
+        group=str(settings.get("group") or "") or None,
+        name=str(settings.get("name") or "") or None,
+        tags=list(settings.get("tags") or []),
+        config={"overrides": overrides},
+    )
+    log.info("Weights & Biases run initialized: %s", getattr(run, "name", "unknown"))
+    return run
+
+
+def _resolve_lm_eval_settings(
+    overrides: Dict[str, str],
+    *,
+    run_dir: Path,
+) -> Dict[str, object]:
+    enabled = _parse_bool(
+        _get_first(overrides, ["lm_eval.enabled", "lm_eval.enable"], default=""),
+        False,
+    )
+    tasks = _parse_list(_get_first(overrides, ["lm_eval.tasks"], default=""))
+
+    train_enabled = _parse_bool(
+        _get_first(
+            overrides,
+            ["lm_eval.train.enabled", "lm_eval.train_on_save", "lm_eval.train.on_save"],
+            default="",
+        ),
+        False,
+    )
+    train_tasks = _parse_list(
+        _get_first(overrides, ["lm_eval.train.tasks"], default="")
+    )
+
+    batch_size = parse_batch_size(_get_first(overrides, ["lm_eval.batch_size"], ""), default="auto")
+    num_fewshot = _parse_int(_get_first(overrides, ["lm_eval.num_fewshot"], ""), 0)
+    limit_raw = _get_first(overrides, ["lm_eval.limit"], "")
+    limit = parse_limit(limit_raw, default=None)
+    device = _get_first(overrides, ["lm_eval.device"], default="")
+    log_samples = _parse_bool(_get_first(overrides, ["lm_eval.log_samples"], ""), False)
+    apply_chat_template = _parse_optional_bool(
+        _get_first(overrides, ["lm_eval.apply_chat_template"], "")
+    )
+    trust_remote_code = _parse_optional_bool(
+        _get_first(overrides, ["lm_eval.trust_remote_code"], "")
+    )
+
+    train_batch_size = parse_batch_size(
+        _get_first(overrides, ["lm_eval.train.batch_size"], ""),
+        default=batch_size,
+    )
+    train_num_fewshot = _parse_int(
+        _get_first(overrides, ["lm_eval.train.num_fewshot"], ""), num_fewshot
+    )
+    train_limit_raw = _get_first(overrides, ["lm_eval.train.limit"], "")
+    train_limit = parse_limit(train_limit_raw, default=None)
+    if train_enabled and not train_limit_raw:
+        train_limit = 64
+    train_device = _get_first(overrides, ["lm_eval.train.device"], default=device)
+
+    results_path = _get_first(
+        overrides, ["lm_eval.results_path"], default=str(run_dir / LM_EVAL_RESULTS_FILENAME)
+    )
+
+    return {
+        "enabled": enabled,
+        "tasks": tasks,
+        "batch_size": batch_size,
+        "num_fewshot": num_fewshot,
+        "limit": limit,
+        "device": device,
+        "log_samples": log_samples,
+        "apply_chat_template": apply_chat_template,
+        "trust_remote_code": trust_remote_code,
+        "train_enabled": train_enabled,
+        "train_tasks": train_tasks,
+        "train_batch_size": train_batch_size,
+        "train_num_fewshot": train_num_fewshot,
+        "train_limit": train_limit,
+        "train_device": train_device,
+        "results_path": results_path,
+    }
+
+
+def _run_lm_eval_and_log(
+    *,
+    log: logging.Logger,
+    hf_token: str,
+    model_ref: str,
+    tasks: List[str],
+    batch_size: Union[int, str],
+    device: str,
+    num_fewshot: int,
+    limit: Optional[Union[int, float]],
+    log_samples: bool,
+    apply_chat_template: Optional[bool],
+    trust_remote_code: Optional[bool],
+    phase: str,
+    results_path: Path,
+    run_meta: Dict[str, object],
+    wandb_run: Optional[object] = None,
+    global_step: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not tasks:
+        raise ValueError("lm_eval tasks list is empty.")
+
+    log.info(
+        "lm_eval (%s): model=%s tasks=%s limit=%s batch_size=%s device=%s",
+        phase,
+        model_ref,
+        ",".join(tasks),
+        limit,
+        batch_size,
+        device or "auto",
+    )
+    results = run_lm_eval(
+        model_ref=model_ref,
+        tasks=tasks,
+        batch_size=batch_size,
+        device=device or "cpu",
+        num_fewshot=num_fewshot,
+        limit=limit,
+        hf_token=hf_token,
+        log_samples=log_samples,
+        apply_chat_template=apply_chat_template,
+        trust_remote_code=trust_remote_code,
+    )
+
+    redacted_results = redact_lm_eval_result(results)
+    payload = {
+        "created_at": _now_iso(),
+        "phase": phase,
+        "model_ref": model_ref,
+        "tasks": tasks,
+        "num_fewshot": num_fewshot,
+        "batch_size": batch_size,
+        "device": device,
+        "limit": limit,
+        "log_samples": log_samples,
+        "apply_chat_template": apply_chat_template,
+        "trust_remote_code": trust_remote_code,
+        "meta": run_meta,
+        "results": redacted_results,
+    }
+    append_jsonl_safe(results_path, payload)
+
+    if wandb_run is not None:
+        metrics = flatten_lm_eval_scalars(results, prefix=f"lm_eval/{phase}")
+        if metrics:
+            import wandb
+
+            if global_step is not None:
+                metrics[f"lm_eval/{phase}/global_step"] = float(global_step)
+            wandb.log(metrics)
+
+    return results
 
 
 def _append_jsonl(path: Path, row: Dict[str, object]) -> None:
@@ -325,6 +596,83 @@ def _clear_dir_contents(path: Path) -> None:
                 child.unlink()
             except FileNotFoundError:
                 pass
+
+
+class LmEvalCallback(TrainerCallback):
+    def __init__(
+        self,
+        *,
+        log: logging.Logger,
+        hf_token: str,
+        tasks: List[str],
+        batch_size: Union[int, str],
+        device: str,
+        num_fewshot: int,
+        limit: Optional[Union[int, float]],
+        log_samples: bool,
+        apply_chat_template: Optional[bool],
+        trust_remote_code: Optional[bool],
+        results_path: Path,
+        run_meta: Dict[str, object],
+        wandb_run: Optional[object] = None,
+    ) -> None:
+        super().__init__()
+        self._log = log
+        self._hf_token = hf_token
+        self._tasks = tasks
+        self._batch_size = batch_size
+        self._device = device
+        self._num_fewshot = num_fewshot
+        self._limit = limit
+        self._log_samples = log_samples
+        self._apply_chat_template = apply_chat_template
+        self._trust_remote_code = trust_remote_code
+        self._results_path = results_path
+        self._run_meta = run_meta
+        self._wandb_run = wandb_run
+        self._last_step: Optional[int] = None
+
+    def on_save(self, args, state, control, **kwargs):
+        if not is_rank0():
+            return control
+
+        step = int(getattr(state, "global_step", 0) or 0)
+        if step <= 0:
+            return control
+        if self._last_step == step:
+            return control
+
+        checkpoint_dir = Path(args.output_dir) / f"checkpoint-{step}"
+        if not checkpoint_dir.exists():
+            self._log.warning(
+                "lm_eval skipped: checkpoint directory missing at %s", checkpoint_dir
+            )
+            return control
+
+        self._last_step = step
+        try:
+            _run_lm_eval_and_log(
+                log=self._log,
+                hf_token=self._hf_token,
+                model_ref=str(checkpoint_dir),
+                tasks=self._tasks,
+                batch_size=self._batch_size,
+                device=self._device,
+                num_fewshot=self._num_fewshot,
+                limit=self._limit,
+                log_samples=self._log_samples,
+                apply_chat_template=self._apply_chat_template,
+                trust_remote_code=self._trust_remote_code,
+                phase="train",
+                results_path=self._results_path,
+                run_meta=self._run_meta,
+                wandb_run=self._wandb_run,
+                global_step=step,
+            )
+        except Exception as exc:
+            self._log.exception("lm_eval during training failed: %s", exc)
+
+        return control
 
 
 class _SamplerTrainerMixin:
@@ -674,9 +1022,35 @@ def _run_training(
     run_dir: Path,
     overrides: Dict[str, str],
     log: logging.Logger,
+    wandb_enabled: bool = False,
+    wandb_run: Optional[object] = None,
+    lm_eval_settings: Optional[Dict[str, object]] = None,
 ) -> None:
     hf_token = os.environ.get("HF_TOKEN")
     device = _resolve_device()
+
+    lm_eval_settings = lm_eval_settings or {}
+    lm_eval_enabled = bool(lm_eval_settings.get("enabled"))
+    lm_eval_train_enabled = bool(lm_eval_settings.get("train_enabled"))
+    if (lm_eval_enabled or lm_eval_train_enabled) and importlib.util.find_spec(
+        "lm_eval"
+    ) is None:
+        raise RuntimeError(
+            "lm-eval is enabled but not installed. Add lm-eval[hf] to dependencies."
+        )
+
+    lm_eval_tasks = list(lm_eval_settings.get("tasks") or [])
+    lm_eval_train_tasks = list(lm_eval_settings.get("train_tasks") or []) or lm_eval_tasks
+    if lm_eval_enabled and not lm_eval_tasks:
+        raise ValueError("lm_eval.enabled=true but no lm_eval.tasks provided.")
+    if lm_eval_train_enabled and not lm_eval_train_tasks:
+        raise ValueError(
+            "lm_eval.train.enabled=true but no lm_eval.train.tasks provided."
+        )
+
+    lm_eval_results_path = Path(
+        lm_eval_settings.get("results_path") or run_dir / LM_EVAL_RESULTS_FILENAME
+    )
 
     teacher_model_name = _get_first(
         overrides,
@@ -1089,11 +1463,33 @@ def _run_training(
         overrides, ["run.exp_name", "run_artifact_id", "entry_id"], default=run_dir.name
     )
 
+    if wandb_run is not None:
+        try:
+            wandb_run.config.update(
+                {
+                    "teacher_model": teacher_model_name,
+                    "tokenizer_model": tokenizer_model,
+                    "distill_loss": distill_loss,
+                    "distill_method": _get_first(
+                        overrides, ["distill_method", "distillation.method"], default=""
+                    ),
+                    "dataset": dataset_name,
+                    "train_split": train_split,
+                    "train_samples": len(train_dataset),
+                    "eval_samples": len(eval_dataset) if eval_dataset is not None else 0,
+                    "student_init_strategy": student_init_strategy,
+                    "student_hidden_size": student_hidden_size_opt or student_hidden_size,
+                },
+                allow_val_change=True,
+            )
+        except Exception as exc:
+            log.warning("wandb config update failed: %s", exc)
+
     training_args_kwargs = {
         "output_dir": str(run_dir),
         "overwrite_output_dir": True,
         "run_name": run_name,
-        "report_to": "none",
+        "report_to": ["wandb"] if wandb_enabled else "none",
         "num_train_epochs": epochs,
         "max_steps": max_steps,
         "per_device_train_batch_size": per_device_train_batch_size,
@@ -1151,6 +1547,35 @@ def _run_training(
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
     }
+    run_meta = {
+        "run_name": run_name,
+        "run_dir": str(run_dir),
+        "artifact_id": run_dir.name,
+        "teacher_model": teacher_model_name,
+        "student_init_strategy": student_init_strategy,
+        "distill_loss": distill_loss,
+    }
+    callbacks: List[TrainerCallback] = []
+    if lm_eval_train_enabled:
+        callbacks.append(
+            LmEvalCallback(
+                log=log,
+                hf_token=hf_token or "",
+                tasks=lm_eval_train_tasks,
+                batch_size=lm_eval_settings.get("train_batch_size") or "auto",
+                device=str(lm_eval_settings.get("train_device") or device),
+                num_fewshot=int(lm_eval_settings.get("train_num_fewshot") or 0),
+                limit=lm_eval_settings.get("train_limit"),
+                log_samples=bool(lm_eval_settings.get("log_samples") or False),
+                apply_chat_template=lm_eval_settings.get("apply_chat_template"),
+                trust_remote_code=lm_eval_settings.get("trust_remote_code"),
+                results_path=lm_eval_results_path,
+                run_meta=run_meta,
+                wandb_run=wandb_run,
+            )
+        )
+    if callbacks:
+        trainer_kwargs["callbacks"] = callbacks
 
     teacher_model = None
     if distill_loss == "kld":
@@ -1237,6 +1662,26 @@ def _run_training(
     log.info("Training complete. student_actual_params=%s", student_actual_params)
     log.info("Saved safetensors size (MB): %.4f", student_safetensors_mb)
 
+    if lm_eval_enabled and is_rank0():
+        _run_lm_eval_and_log(
+            log=log,
+            hf_token=hf_token or "",
+            model_ref=str(run_dir),
+            tasks=lm_eval_tasks,
+            batch_size=lm_eval_settings.get("batch_size") or "auto",
+            device=str(lm_eval_settings.get("device") or device),
+            num_fewshot=int(lm_eval_settings.get("num_fewshot") or 0),
+            limit=lm_eval_settings.get("limit"),
+            log_samples=bool(lm_eval_settings.get("log_samples") or False),
+            apply_chat_template=lm_eval_settings.get("apply_chat_template"),
+            trust_remote_code=lm_eval_settings.get("trust_remote_code"),
+            phase="post_train",
+            results_path=lm_eval_results_path,
+            run_meta=run_meta,
+            wandb_run=wandb_run,
+            global_step=state_global_step if state_global_step >= 0 else None,
+        )
+
     run_metrics_payload = {
         "created_at": _now_iso(),
         "train_metrics": metrics,
@@ -1246,6 +1691,9 @@ def _run_training(
         "distill_loss": distill_loss,
         "distill_temperature": temperature,
         "distill_alpha": alpha,
+        "lm_eval_results_path": str(lm_eval_results_path)
+        if (lm_eval_enabled or lm_eval_train_enabled)
+        else "",
     }
     _write_run_meta(
         run_dir,
@@ -1283,6 +1731,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     log_path = run_dir / "run_distill.log"
     _init_file_logger(log, log_path)
 
+    run_name = _get_first(
+        overrides, ["run.exp_name", "run_artifact_id", "entry_id"], default=artifact_id
+    )
+    wandb_settings = _resolve_wandb_settings(
+        overrides, run_name=run_name, run_dir=run_dir
+    )
+    wandb_run = _maybe_init_wandb(wandb_settings, overrides=overrides, log=log)
+    lm_eval_settings = _resolve_lm_eval_settings(overrides, run_dir=run_dir)
+
     submitted_at = _now_iso()
     status = "success"
     error_note = ""
@@ -1298,11 +1755,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             payload={
                 "created_at": _now_iso(),
                 "overrides": overrides,
+                "wandb": {
+                    "enabled": bool(wandb_settings.get("enabled")),
+                    "project": wandb_settings.get("project"),
+                    "entity": wandb_settings.get("entity"),
+                    "group": wandb_settings.get("group"),
+                    "name": wandb_settings.get("name"),
+                },
+                "lm_eval": make_json_safe(lm_eval_settings),
             },
             filename="RUN_META.json",
         )
 
-        _run_training(run_dir=run_dir, overrides=overrides, log=log)
+        _run_training(
+            run_dir=run_dir,
+            overrides=overrides,
+            log=log,
+            wandb_enabled=bool(wandb_settings.get("enabled")) and is_rank0(),
+            wandb_run=wandb_run,
+            lm_eval_settings=lm_eval_settings,
+        )
 
     except Exception as exc:
         status = "failed"
@@ -1322,6 +1794,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         _append_jsonl(Path(args.results_path), result_row)
         print(json.dumps(result_row, ensure_ascii=True))
+        if wandb_run is not None and is_rank0():
+            try:
+                import wandb
+
+                summary_payload = {
+                    "status": status,
+                    "train_loss": result_row.get("train_loss"),
+                    "eval_loss": result_row.get("eval_loss"),
+                    "train_runtime_s": result_row.get("train_runtime_s"),
+                    "train_samples_per_second": result_row.get("train_samples_per_second"),
+                    "train_steps_per_second": result_row.get("train_steps_per_second"),
+                    "student_actual_params": result_row.get("student_actual_params"),
+                    "student_safetensors_mb": result_row.get("student_safetensors_mb"),
+                }
+                wandb.run.summary.update(summary_payload)
+                wandb.finish()
+            except Exception as exc:
+                log.warning("wandb finalize failed: %s", exc)
 
     return 0 if status == "success" else 1
 
