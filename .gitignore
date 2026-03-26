@@ -26,6 +26,8 @@ dist/
 # Distillation outputs
 experiments/cluster/
 experiments/lm_eval_results.jsonl
+experiments/lm_eval_suite_results.jsonl
+experiments/lm_eval_suite_timing.csv
 experiments/runs_distill/
 experiments/results_distill.jsonl
 experiments/smoke/

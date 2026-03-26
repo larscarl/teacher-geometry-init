@@ -143,6 +143,48 @@ uv run python -m src.experiments.lm_eval_runner \
   --limit 64
 ```
 
+Model/task timing matrix (smoke + full suite):
+
+```bash
+uv run python -m src.experiments.lm_eval_suite_runner \
+  --models gemma3_270m=google/gemma-3-270m,gemma3_1b_pt=google/gemma-3-1b-pt,apertus_8b=swiss-ai/Apertus-8B-2509,llama32_1b=meta-llama/Llama-3.2-1B \
+  --tasks mmlu_stem,hellaswag,arc_challenge,piqa,winogrande,boolq,gsm8k_cot_llama \
+  --device cpu \
+  --batch-size auto \
+  --smoke \
+  --smoke-limit 2 \
+  --suite-id local_smoke_model_matrix
+```
+
+For full-dataset runtime measurement (for cluster planning):
+
+```bash
+uv run python -m src.experiments.lm_eval_suite_runner \
+  --models gemma3_270m=google/gemma-3-270m,gemma3_1b_pt=google/gemma-3-1b-pt,apertus_8b=swiss-ai/Apertus-8B-2509,llama32_1b=meta-llama/Llama-3.2-1B \
+  --tasks mmlu_stem,hellaswag,arc_challenge,piqa,winogrande,boolq,gsm8k_cot_llama \
+  --device cuda:0 \
+  --batch-size auto \
+  --suite-id cluster_full_model_matrix
+```
+
+Submit the same full suite via Slurm:
+
+```bash
+sbatch --time=24:00:00 --nodes=1 --ntasks=1 --mem=80G --partition=gpu_top --gres=gpu:1 --cpus-per-task=8 \
+  --job-name=lm_eval_full_matrix \
+  sbatchs/lmic_lm_eval_suite.submit \
+  --models gemma3_270m=google/gemma-3-270m,gemma3_1b_pt=google/gemma-3-1b-pt,apertus_8b=swiss-ai/Apertus-8B-2509,llama32_1b=meta-llama/Llama-3.2-1B \
+  --tasks mmlu_stem,hellaswag,arc_challenge,piqa,winogrande,boolq,gsm8k_cot_llama \
+  --device cuda:0 \
+  --batch-size auto \
+  --suite-id cluster_full_model_matrix
+```
+
+Outputs:
+- `experiments/lm_eval_suite_results.jsonl` (detailed per model/task results, redacted).
+- `experiments/lm_eval_suite_timing.csv` (per-task runtime table with `duration_s`, sample counts, and primary metric).
+- stdout JSON lines include per-task rows plus `summary_type=model_total` and `summary_type=suite_total`.
+
 ## Meaningful Local Benchmark Smoke
 
 The tiny 4-sample smoke set is useful for plumbing checks, but benchmark scores often do not move in a meaningful way.  
