@@ -185,6 +185,61 @@ Outputs:
 - `experiments/lm_eval_suite_timing.csv` (per-task runtime table with `duration_s`, sample counts, and primary metric).
 - stdout JSON lines include per-task rows plus `summary_type=model_total` and `summary_type=suite_total`.
 
+## FineWeb Distillation
+
+The distillation runner now supports Hugging Face dataset source overrides:
+- `data.hf_path` (for example `HuggingFaceFW/fineweb`)
+- `data.hf_config` (for example `sample-10BT` or `CC-MAIN-2024-18`)
+- `data.hf_train_split` / `data.hf_eval_split`
+- `data.streaming=true|false`
+
+Important:
+- In streaming mode (`data.streaming=true`), `model.train_args.max_steps` must be set.
+- Streaming eval is intentionally blocked; use a finite prepared eval split.
+- For large runs, prefer preparing local chunked JSONL files first.
+
+Prepare local chunked FineWeb subsets (recommended):
+
+```bash
+uv run python -m src.experiments.prepare_fineweb \
+  --hf-path HuggingFaceFW/fineweb \
+  --hf-config sample-10BT \
+  --train-split train \
+  --eval-split train \
+  --train-documents 20000 \
+  --eval-documents 2000 \
+  --tokenizer-model google/gemma-3-270m \
+  --chunk-length 1024 \
+  --streaming \
+  --shuffle \
+  --output-dir experiments/fineweb_sample10bt_gemma3_270m_l1024
+```
+
+Run distillation on the prepared FineWeb subsets:
+
+```bash
+uv run python -m src.distillation.run_distill \
+  run_artifact_id=fineweb-gemma3-270m-pca \
+  distillation.teacher_model=google/gemma-3-270m \
+  distillation.student.init_strategy=pca_layerwise \
+  distillation.student.init_cache_dir=experiments/cache_fineweb_pca \
+  data.input_path=HuggingFaceFW/fineweb \
+  data.hf_path=HuggingFaceFW/fineweb \
+  data.hf_config=sample-10BT \
+  data.prepared_dir=experiments/fineweb_sample10bt_gemma3_270m_l1024 \
+  data.prepared_split=train \
+  data.eval_prepared_dir=experiments/fineweb_sample10bt_gemma3_270m_l1024 \
+  data.eval_prepared_split=eval \
+  tokenizer.chunk_length=1024 \
+  distillation.max_train_samples=20000 \
+  distillation.max_eval_samples=2000 \
+  model.train_args.num_train_epochs=1 \
+  model.train_args.per_device_train_batch_size=4 \
+  model.train_args.gradient_accumulation_steps=4 \
+  model.train_args.learning_rate=3e-5 \
+  --log-level=INFO
+```
+
 ## Meaningful Local Benchmark Smoke
 
 The tiny 4-sample smoke set is useful for plumbing checks, but benchmark scores often do not move in a meaningful way.  

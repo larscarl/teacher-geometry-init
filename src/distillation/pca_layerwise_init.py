@@ -26,6 +26,7 @@ from sklearn.decomposition import PCA
 
 # Reuse shared infrastructure from UMAP module
 from src.distillation.umap_layerwise_init import (
+    _dataset_fingerprint,
     cache_teacher_hidden_states,
     train_all_layers,
 )
@@ -219,7 +220,7 @@ def _student_cache_key(
     init_cosine_loss_weight: float,
     init_max_grad_norm: float,
     init_warmup_fraction: float,
-    dataset_name: str = "wikitext",
+    dataset_fingerprint: str = "wikitext",
 ) -> str:
     """Build a deterministic cache key for an initialized student model."""
     import hashlib
@@ -228,7 +229,7 @@ def _student_cache_key(
         f"{strategy}|{teacher_model_name}|{hidden_size}|{scale_factor}|"
         f"{num_samples}|{max_length}|{init_epochs}|{init_batch_size}|"
         f"{init_lr}|{init_weight_decay}|{init_cosine_loss_weight}|"
-        f"{init_max_grad_norm}|{init_warmup_fraction}|{dataset_name}"
+        f"{init_max_grad_norm}|{init_warmup_fraction}|{dataset_fingerprint}"
     )
     short_hash = hashlib.md5(raw.encode()).hexdigest()[:10]
     safe_name = teacher_model_name.replace("/", "_").replace("\\", "_")
@@ -251,6 +252,10 @@ def pca_layerwise_init(
     init_warmup_fraction: float = 0.1,
     dataset_name: str = "wikitext",
     dataset_path: Optional[str] = None,
+    dataset_hf_path: Optional[str] = None,
+    dataset_hf_config: str = "",
+    dataset_hf_split: str = "train",
+    dataset_streaming: bool = False,
     device: str = "cuda",
 ):
     """
@@ -266,8 +271,17 @@ def pca_layerwise_init(
     print("PCA Layer-wise Initialization")
     print("=" * 60)
 
-    dataset_name = str(dataset_name or "wikitext")
+    dataset_name = str(dataset_name or "")
     dataset_path = str(dataset_path or dataset_name)
+    dataset_hf_path = str(dataset_hf_path or "")
+    dataset_fp = _dataset_fingerprint(
+        dataset_name=dataset_name,
+        dataset_path=dataset_path,
+        dataset_hf_path=dataset_hf_path,
+        dataset_hf_config=dataset_hf_config,
+        dataset_hf_split=dataset_hf_split,
+        dataset_streaming=bool(dataset_streaming),
+    )
 
     # Determine student hidden size early (needed for cache key)
     if hidden_size is None:
@@ -290,7 +304,7 @@ def pca_layerwise_init(
         init_cosine_loss_weight,
         init_max_grad_norm,
         init_warmup_fraction,
-        dataset_name=dataset_name,
+        dataset_fingerprint=dataset_fp,
     )
     student_cache_path = Path(cache_dir) / student_key
     student_marker = student_cache_path / "done.marker"
@@ -316,6 +330,10 @@ def pca_layerwise_init(
         device,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
+        dataset_hf_path=dataset_hf_path,
+        dataset_hf_config=dataset_hf_config,
+        dataset_hf_split=dataset_hf_split,
+        dataset_streaming=bool(dataset_streaming),
     )
 
     # Step 2: PCA reduce all layers + embeddings

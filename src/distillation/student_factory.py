@@ -152,6 +152,10 @@ def create_student_model(
             init_weight_decay=student_init_cfg.get("init_weight_decay", 0.01),
             dataset_name=student_init_cfg.get("dataset_name", "wikitext"),
             dataset_path=student_init_cfg.get("dataset_path"),
+            dataset_hf_path=student_init_cfg.get("dataset_hf_path"),
+            dataset_hf_config=student_init_cfg.get("dataset_hf_config"),
+            dataset_hf_split=student_init_cfg.get("dataset_hf_split", "train"),
+            dataset_streaming=student_init_cfg.get("dataset_streaming", False),
             device=device,
         )
 
@@ -179,6 +183,10 @@ def create_student_model(
             init_warmup_fraction=student_init_cfg.get("init_warmup_fraction", 0.1),
             dataset_name=student_init_cfg.get("dataset_name", "wikitext"),
             dataset_path=student_init_cfg.get("dataset_path"),
+            dataset_hf_path=student_init_cfg.get("dataset_hf_path"),
+            dataset_hf_config=student_init_cfg.get("dataset_hf_config"),
+            dataset_hf_split=student_init_cfg.get("dataset_hf_split", "train"),
+            dataset_streaming=student_init_cfg.get("dataset_streaming", False),
             device=device,
         )
 

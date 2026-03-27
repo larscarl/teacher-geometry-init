@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, IterableDataset, load_dataset, load_from_disk
 from torch.utils.data import DistributedSampler, RandomSampler, SequentialSampler
 from transformers import (
     AutoModelForCausalLM,
@@ -43,6 +43,28 @@ from src.utils.lm_eval_utils import (
 DEFAULT_RESULTS_PATH = "experiments/results_distill.jsonl"
 DEFAULT_RUN_DIR_BASE = "experiments/runs_distill"
 LM_EVAL_RESULTS_FILENAME = "LM_EVAL_RESULTS.jsonl"
+
+
+def _is_iterable_dataset(dataset: object) -> bool:
+    return isinstance(dataset, IterableDataset)
+
+
+def _dataset_len(dataset: object) -> Optional[int]:
+    if dataset is None or _is_iterable_dataset(dataset):
+        return None
+    if hasattr(dataset, "__len__"):
+        try:
+            return int(len(dataset))
+        except Exception:
+            return None
+    return None
+
+
+def _dataset_size_str(dataset: object) -> str:
+    n = _dataset_len(dataset)
+    if n is None:
+        return "streaming/unknown"
+    return str(n)
 
 
 def _load_env_file(path: Path, *, override: bool = False) -> None:
@@ -454,6 +476,23 @@ def _resolve_dir_payload_path(data_dir: Path, split: str) -> Optional[Path]:
     return None
 
 
+def _prepare_hf_dataset_kwargs(
+    *,
+    hf_path: str,
+    hf_config: str,
+    streaming: bool,
+) -> Dict[str, object]:
+    kwargs: Dict[str, object] = {}
+    path = _strip(hf_path)
+    config = _strip(hf_config)
+    if path:
+        kwargs["path"] = path
+    if config:
+        kwargs["name"] = config
+    kwargs["streaming"] = bool(streaming)
+    return kwargs
+
+
 def _load_dataset_from_path(path: Path, split: str) -> Dataset:
     split = _strip(split) or "train"
 
@@ -480,10 +519,13 @@ def _load_dataset_from_path(path: Path, split: str) -> Dataset:
 def _load_raw_dataset(
     *,
     dataset_name: str,
+    hf_path: str,
+    hf_config: str,
     split: str,
     prepared_path: str,
     prepared_dir: str,
-) -> Dataset:
+    streaming: bool,
+) -> Union[Dataset, IterableDataset]:
     explicit_path = _strip(prepared_path)
     explicit_dir = _strip(prepared_dir)
 
@@ -493,12 +535,35 @@ def _load_raw_dataset(
     if explicit_dir:
         return _load_dataset_from_path(Path(explicit_dir), split=split)
 
+    if streaming and (_strip(explicit_path) or _strip(explicit_dir)):
+        raise ValueError(
+            "Streaming mode does not support local prepared_path/prepared_dir inputs. "
+            "Use Hugging Face dataset path/config instead."
+        )
+
+    hf_path = _strip(hf_path)
+    hf_config = _strip(hf_config)
+    if hf_path:
+        kwargs = _prepare_hf_dataset_kwargs(
+            hf_path=hf_path,
+            hf_config=hf_config,
+            streaming=streaming,
+        )
+        kwargs["split"] = _strip(split) or "train"
+        return load_dataset(**kwargs)
+
     dataset_name = _strip(dataset_name)
     if dataset_name and Path(dataset_name).exists():
         return _load_dataset_from_path(Path(dataset_name), split=split)
 
     if dataset_name:
-        return load_dataset(dataset_name, split=split)
+        kwargs = _prepare_hf_dataset_kwargs(
+            hf_path=dataset_name,
+            hf_config=hf_config,
+            streaming=streaming,
+        )
+        kwargs["split"] = _strip(split) or "train"
+        return load_dataset(**kwargs)
 
     raise ValueError(
         "No data source resolved. Set data.prepared_path or data.prepared_dir "
@@ -506,12 +571,22 @@ def _load_raw_dataset(
     )
 
 
+def _limit_raw_dataset(
+    dataset: Union[Dataset, IterableDataset], *, max_samples: int
+) -> Union[Dataset, IterableDataset]:
+    if max_samples <= 0:
+        return dataset
+    if _is_iterable_dataset(dataset):
+        return dataset.take(max_samples)
+    return dataset.select(range(min(max_samples, len(dataset))))
+
+
 def _tokenize_or_normalize_dataset(
     *,
-    dataset: Dataset,
+    dataset: Union[Dataset, IterableDataset],
     tokenizer,
     max_seq_length: int,
-) -> Dataset:
+) -> Union[Dataset, IterableDataset]:
     has_input_ids = "input_ids" in dataset.column_names
 
     if has_input_ids:
@@ -737,7 +812,11 @@ def _build_result_row(
         ["run_artifact_id", "run.artifact_id", "run.exp_name", "run.run_id"],
         default=run_dir.name,
     )
-    dataset = _get_first(overrides, ["dataset", "data.input_path"], default="unknown")
+    dataset = _get_first(
+        overrides,
+        ["dataset", "data.input_path", "data.hf_path"],
+        default="unknown",
+    )
     split = _get_first(
         overrides,
         ["split", "data.prepared_split", "data.split"],
@@ -919,7 +998,11 @@ def _build_student_init_cfg(overrides: Dict[str, str]) -> Optional[dict]:
     if not cache_dir:
         return None
 
-    dataset_name = _get_first(overrides, ["data.input_path"], default="wikitext")
+    dataset_name = _get_first(
+        overrides,
+        ["data.input_path", "dataset", "data.hf_path"],
+        default="wikitext",
+    )
     dataset_path = _get_first(
         overrides,
         [
@@ -928,6 +1011,17 @@ def _build_student_init_cfg(overrides: Dict[str, str]) -> Optional[dict]:
             "data.prepared_dir",
         ],
         default=dataset_name,
+    )
+    hf_path = _get_first(overrides, ["data.hf_path"], default=dataset_name)
+    hf_config = _get_first(overrides, ["data.hf_config"], default="")
+    hf_split = _get_first(
+        overrides,
+        ["data.hf_train_split", "data.prepared_split", "data.split", "split"],
+        default="train",
+    )
+    streaming = _parse_bool(
+        _get_first(overrides, ["data.streaming"], default=""),
+        default=False,
     )
 
     cfg = {
@@ -987,6 +1081,10 @@ def _build_student_init_cfg(overrides: Dict[str, str]) -> Optional[dict]:
         ),
         "dataset_name": dataset_name,
         "dataset_path": dataset_path,
+        "dataset_hf_path": hf_path,
+        "dataset_hf_config": hf_config,
+        "dataset_hf_split": hf_split,
+        "dataset_streaming": streaming,
     }
     return cfg
 
@@ -1075,21 +1173,42 @@ def _run_training(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset_name = _get_first(overrides, ["data.input_path", "dataset"], default="")
+    dataset_name = _get_first(
+        overrides, ["data.input_path", "dataset", "data.hf_path"], default=""
+    )
+    dataset_hf_path = _get_first(overrides, ["data.hf_path"], default="")
+    dataset_hf_config = _get_first(overrides, ["data.hf_config"], default="")
+    data_streaming = _parse_bool(
+        _get_first(overrides, ["data.streaming"], default=""),
+        default=False,
+    )
     train_split = _get_first(
         overrides,
-        ["data.prepared_split", "data.split", "split"],
+        ["data.hf_train_split", "data.prepared_split", "data.split", "split"],
         default="train",
     )
     train_prepared_path = _get_first(overrides, ["data.prepared_path"], default="")
     train_prepared_dir = _get_first(overrides, ["data.prepared_dir"], default="")
 
+    max_train_samples = _parse_int(
+        _get_first(
+            overrides,
+            ["distillation.max_train_samples", "data.max_train_samples"],
+            default="",
+        ),
+        default=-1,
+    )
+
     train_raw = _load_raw_dataset(
         dataset_name=dataset_name,
+        hf_path=dataset_hf_path,
+        hf_config=dataset_hf_config,
         split=train_split,
         prepared_path=train_prepared_path,
         prepared_dir=train_prepared_dir,
+        streaming=data_streaming,
     )
+    train_raw = _limit_raw_dataset(train_raw, max_samples=max_train_samples)
 
     max_seq_length = _parse_int(
         _get_first(
@@ -1105,37 +1224,15 @@ def _run_training(
         max_seq_length=max_seq_length,
     )
 
-    max_train_samples = _parse_int(
-        _get_first(
-            overrides,
-            ["distillation.max_train_samples", "data.max_train_samples"],
-            default="",
-        ),
-        default=-1,
-    )
-    if max_train_samples > 0:
-        train_dataset = train_dataset.select(
-            range(min(max_train_samples, len(train_dataset)))
-        )
-
     eval_dataset = None
     eval_prepared_path = _get_first(overrides, ["data.eval_prepared_path"], default="")
     eval_prepared_dir = _get_first(overrides, ["data.eval_prepared_dir"], default="")
     eval_split = _get_first(
-        overrides, ["data.eval_prepared_split", "data.eval_split"], default=""
+        overrides,
+        ["data.hf_eval_split", "data.eval_prepared_split", "data.eval_split"],
+        default="",
     )
     if eval_prepared_path or eval_prepared_dir or eval_split:
-        eval_raw = _load_raw_dataset(
-            dataset_name=dataset_name,
-            split=(eval_split or "eval"),
-            prepared_path=eval_prepared_path,
-            prepared_dir=eval_prepared_dir,
-        )
-        eval_dataset = _tokenize_or_normalize_dataset(
-            dataset=eval_raw,
-            tokenizer=tokenizer,
-            max_seq_length=max_seq_length,
-        )
         max_eval_samples = _parse_int(
             _get_first(
                 overrides,
@@ -1144,16 +1241,38 @@ def _run_training(
             ),
             default=-1,
         )
-        if max_eval_samples > 0:
-            eval_dataset = eval_dataset.select(
-                range(min(max_eval_samples, len(eval_dataset)))
-            )
+        eval_raw = _load_raw_dataset(
+            dataset_name=dataset_name,
+            hf_path=dataset_hf_path,
+            hf_config=dataset_hf_config,
+            split=(eval_split or "eval"),
+            prepared_path=eval_prepared_path,
+            prepared_dir=eval_prepared_dir,
+            streaming=data_streaming,
+        )
+        eval_raw = _limit_raw_dataset(eval_raw, max_samples=max_eval_samples)
+        eval_dataset = _tokenize_or_normalize_dataset(
+            dataset=eval_raw,
+            tokenizer=tokenizer,
+            max_seq_length=max_seq_length,
+        )
 
     log.info("Device: %s", device)
     log.info("Teacher model: %s", teacher_model_name)
     log.info("Tokenizer model: %s", tokenizer_model)
-    log.info("Train split: %s | #samples=%s", train_split, len(train_dataset))
+    log.info(
+        "Data source: hf_path=%s hf_config=%s streaming=%s input_path=%s",
+        dataset_hf_path or "<auto>",
+        dataset_hf_config or "<none>",
+        data_streaming,
+        dataset_name or "<none>",
+    )
+    log.info(
+        "Train split: %s | #samples=%s", train_split, _dataset_size_str(train_dataset)
+    )
     log.info("Eval enabled: %s", eval_dataset is not None)
+    if eval_dataset is not None:
+        log.info("Eval split: %s | #samples=%s", eval_split or "eval", _dataset_size_str(eval_dataset))
 
     student_scale_factor = _parse_float(
         _get_first(overrides, ["distillation.student.scale_factor"], default=""),
@@ -1434,6 +1553,16 @@ def _run_training(
         ),
         default=-1,
     )
+    if _is_iterable_dataset(train_dataset) and max_steps <= 0:
+        raise ValueError(
+            "Training dataset is streaming/iterable, so max_steps must be set "
+            "(model.train_args.max_steps or distillation.train.max_steps > 0)."
+        )
+    if _is_iterable_dataset(eval_dataset):
+        raise ValueError(
+            "Eval dataset is streaming/iterable. Please provide a finite eval split "
+            "(non-streaming prepared eval files/dataset) for evaluation."
+        )
 
     dataloader_num_workers = _parse_int(
         _get_first(
@@ -1475,8 +1604,11 @@ def _run_training(
                     ),
                     "dataset": dataset_name,
                     "train_split": train_split,
-                    "train_samples": len(train_dataset),
-                    "eval_samples": len(eval_dataset) if eval_dataset is not None else 0,
+                    "train_samples": _dataset_len(train_dataset) or -1,
+                    "eval_samples": _dataset_len(eval_dataset) if eval_dataset is not None else 0,
+                    "data_streaming": data_streaming,
+                    "dataset_hf_path": dataset_hf_path,
+                    "dataset_hf_config": dataset_hf_config,
                     "student_init_strategy": student_init_strategy,
                     "student_hidden_size": student_hidden_size_opt or student_hidden_size,
                 },
@@ -1630,10 +1762,10 @@ def _run_training(
     overrides["student_safetensors_mb"] = f"{student_safetensors_mb:.6f}"
     overrides["distillation.temperature"] = f"{temperature}"
     overrides["distillation.alpha"] = f"{alpha}"
-    overrides["train_num_samples"] = str(len(train_dataset))
-    overrides["eval_num_samples"] = str(
-        len(eval_dataset) if eval_dataset is not None else 0
-    )
+    train_n = _dataset_len(train_dataset)
+    eval_n = _dataset_len(eval_dataset)
+    overrides["train_num_samples"] = str(train_n if train_n is not None else -1)
+    overrides["eval_num_samples"] = str(eval_n if eval_n is not None else 0)
 
     metrics = dict(train_result.metrics or {})
     if "train_loss" in metrics:

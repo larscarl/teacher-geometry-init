@@ -35,17 +35,46 @@ def _cache_key(
     teacher_model_name: str,
     num_samples: int,
     max_length: int,
-    dataset_name: str = "wikitext",
+    dataset_fingerprint: str = "wikitext",
 ) -> str:
-    raw = f"{teacher_model_name}|{num_samples}|{max_length}|{dataset_name}"
+    raw = f"{teacher_model_name}|{num_samples}|{max_length}|{dataset_fingerprint}"
     short_hash = hashlib.md5(raw.encode()).hexdigest()[:8]
     safe_name = teacher_model_name.replace("/", "_").replace("\\", "_")
-    safe_dataset = dataset_name.replace("/", "_").replace("\\", "_").replace(":", "_")
+    safe_dataset = (
+        dataset_fingerprint.replace("/", "_").replace("\\", "_").replace(":", "_")
+    )
     return f"{safe_name}_{safe_dataset}_{num_samples}s_{max_length}l_{short_hash}"
 
 
 def _reduced_subdir(target_dim: int) -> str:
     return f"reduced_dim{target_dim}"
+
+
+def _dataset_fingerprint(
+    *,
+    dataset_name: str,
+    dataset_path: str,
+    dataset_hf_path: str,
+    dataset_hf_config: str,
+    dataset_hf_split: str,
+    dataset_streaming: bool,
+) -> str:
+    path_text = str(dataset_path or "").strip()
+    name_text = str(dataset_name or "").strip()
+    hf_path = str(dataset_hf_path or "").strip()
+    hf_config = str(dataset_hf_config or "").strip()
+    hf_split = str(dataset_hf_split or "").strip() or "train"
+    mode = "stream" if dataset_streaming else "materialized"
+    return "|".join(
+        [
+            f"name={name_text or '<none>'}",
+            f"path={path_text or '<none>'}",
+            f"hf={hf_path or '<none>'}",
+            f"cfg={hf_config or '<none>'}",
+            f"split={hf_split}",
+            f"mode={mode}",
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +257,10 @@ def cache_teacher_hidden_states(
     device: str = "cuda",
     dataset_path: str = "wikitext",
     dataset_name: str = "wikitext",
+    dataset_hf_path: str = "",
+    dataset_hf_config: str = "",
+    dataset_hf_split: str = "train",
+    dataset_streaming: bool = False,
 ) -> Path:
     """Extract teacher hidden states and save to disk. Skip if cache exists.
 
@@ -235,7 +268,20 @@ def cache_teacher_hidden_states(
         dataset_name: Either "wikitext" (loads from HuggingFace) or a local path
             to a pre-chunked dataset (e.g., "data/thunderbird/dataset").
     """
-    key = _cache_key(teacher_model_name, num_samples, max_length, dataset_name)
+    dataset_fp = _dataset_fingerprint(
+        dataset_name=dataset_name,
+        dataset_path=dataset_path,
+        dataset_hf_path=dataset_hf_path,
+        dataset_hf_config=dataset_hf_config,
+        dataset_hf_split=dataset_hf_split,
+        dataset_streaming=dataset_streaming,
+    )
+    key = _cache_key(
+        teacher_model_name,
+        num_samples,
+        max_length,
+        dataset_fingerprint=dataset_fp,
+    )
     cache_path = Path(cache_dir) / key
     metadata_path = cache_path / "metadata.json"
 
@@ -245,7 +291,7 @@ def cache_teacher_hidden_states(
             meta.get("teacher") == teacher_model_name
             and meta.get("num_samples") == num_samples
             and meta.get("max_length") == max_length
-            and meta.get("dataset_name", "wikitext") == dataset_name
+            and meta.get("dataset_fingerprint", "") == dataset_fp
         ):
             print(f"[Cache HIT] Teacher hidden states: {cache_path}")
             return cache_path
@@ -265,9 +311,20 @@ def cache_teacher_hidden_states(
 
     # Load data — either from HuggingFace or local pre-chunked dataset
     texts = _load_texts_for_hidden_states(
-        dataset_path, tokenizer, num_samples, max_length
+        dataset_path=dataset_path,
+        dataset_name=dataset_name,
+        dataset_hf_path=dataset_hf_path,
+        dataset_hf_config=dataset_hf_config,
+        dataset_hf_split=dataset_hf_split,
+        dataset_streaming=dataset_streaming,
+        tokenizer=tokenizer,
+        num_samples=num_samples,
+        max_length=max_length,
     )
-    print(f"Got {len(texts)} texts from '{dataset_name}'")
+    print(
+        f"Got {len(texts)} texts from source "
+        f"(name={dataset_name}, hf={dataset_hf_path}, split={dataset_hf_split})"
+    )
 
     # Extract
     all_hidden = extract_all_hidden_states(
@@ -293,6 +350,12 @@ def cache_teacher_hidden_states(
         "hidden_dim": teacher.config.hidden_size,
         "num_sequences": len(texts),
         "dataset_name": dataset_name,
+        "dataset_path": dataset_path,
+        "dataset_hf_path": dataset_hf_path,
+        "dataset_hf_config": dataset_hf_config,
+        "dataset_hf_split": dataset_hf_split,
+        "dataset_streaming": bool(dataset_streaming),
+        "dataset_fingerprint": dataset_fp,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
@@ -306,6 +369,11 @@ def cache_teacher_hidden_states(
 
 def _load_texts_for_hidden_states(
     dataset_path: str,
+    dataset_name: str,
+    dataset_hf_path: str,
+    dataset_hf_config: str,
+    dataset_hf_split: str,
+    dataset_streaming: bool,
     tokenizer,
     num_samples: int,
     max_length: int,
@@ -313,10 +381,10 @@ def _load_texts_for_hidden_states(
     """Load text samples for teacher hidden state extraction.
 
     Supports:
-        - "wikitext": loads from HuggingFace (original behavior)
-        - local path: loads pre-chunked dataset, decodes token IDs back to text
+        - local path: pre-chunked dataset / jsonl
+        - Hugging Face dataset path/config/split
     """
-    local_path = Path(dataset_path)
+    local_path = Path(dataset_path) if dataset_path else Path("")
 
     # Check for local pre-chunked dataset (e.g., Thunderbird)
     if local_path.exists() and (local_path / "dataset_info.json").exists():
@@ -335,11 +403,47 @@ def _load_texts_for_hidden_states(
             chosen = preferred[0] if preferred else jsonl_files[0]
             return _load_texts_from_jsonl(chosen, tokenizer, num_samples)
 
-    # Default: HuggingFace dataset
-    print(f"Loading {num_samples} samples from WikiText...")
-    dataset = load_dataset("wikitext", "wikitext-103-v1", split="train")
-    texts = [t for t in dataset["text"] if len(t) > 50][:num_samples]
-    return texts
+    hf_path = (dataset_hf_path or dataset_name or "").strip()
+    if hf_path:
+        kwargs = {"path": hf_path, "split": (dataset_hf_split or "train")}
+        if (dataset_hf_config or "").strip():
+            kwargs["name"] = dataset_hf_config.strip()
+        kwargs["streaming"] = bool(dataset_streaming)
+        print(
+            f"Loading {num_samples} samples from HF dataset "
+            f"path={kwargs['path']} name={kwargs.get('name','')} split={kwargs['split']} "
+            f"streaming={kwargs['streaming']}"
+        )
+        dataset = load_dataset(**kwargs)
+
+        texts: list[str] = []
+        if bool(dataset_streaming):
+            rows = dataset.take(num_samples)
+            for row in rows:
+                text = _row_to_text(row, tokenizer)
+                if text:
+                    texts.append(text)
+        else:
+            n = min(num_samples, len(dataset))
+            for i in range(n):
+                row = dataset[i]
+                text = _row_to_text(row, tokenizer)
+                if text:
+                    texts.append(text)
+        return texts
+
+    raise ValueError(
+        "Could not resolve data source for hidden state extraction. "
+        "Provide a local dataset_path or dataset_hf_path/dataset_name."
+    )
+
+
+def _row_to_text(row: dict, tokenizer) -> str:
+    if "text" in row and row["text"] is not None:
+        return str(row["text"])
+    if "input_ids" in row and row["input_ids"] is not None:
+        return tokenizer.decode(row["input_ids"], skip_special_tokens=True)
+    return ""
 
 
 def _load_texts_from_prechunked(
@@ -356,7 +460,14 @@ def _load_texts_from_prechunked(
 
     print(f"Loading pre-chunked dataset from: {path}")
     dataset = load_from_disk(str(path))
-    train_data = dataset["train"]
+    if hasattr(dataset, "keys"):
+        if "train" in dataset:
+            train_data = dataset["train"]
+        else:
+            first_split = next(iter(dataset.keys()))
+            train_data = dataset[first_split]
+    else:
+        train_data = dataset
 
     n = min(num_samples, len(train_data))
     texts = []
@@ -864,7 +975,7 @@ def _umap_student_cache_key(
     init_cosine_loss_weight: float,
     init_max_grad_norm: float,
     init_warmup_fraction: float,
-    dataset_name: str = "wikitext",
+    dataset_fingerprint: str = "wikitext",
 ) -> str:
     """Build a deterministic cache key for an UMAP-initialized student model."""
     raw = (
@@ -873,7 +984,7 @@ def _umap_student_cache_key(
         f"{umap_n_neighbors}|{umap_min_dist}|{umap_metric}|"
         f"{init_epochs}|{init_batch_size}|"
         f"{init_lr}|{init_weight_decay}|{init_cosine_loss_weight}|"
-        f"{init_max_grad_norm}|{init_warmup_fraction}|{dataset_name}"
+        f"{init_max_grad_norm}|{init_warmup_fraction}|{dataset_fingerprint}"
     )
     short_hash = hashlib.md5(raw.encode()).hexdigest()[:10]
     safe_name = teacher_model_name.replace("/", "_").replace("\\", "_")
@@ -899,6 +1010,10 @@ def umap_layerwise_init(
     init_warmup_fraction: float = 0.1,
     dataset_name: str = "wikitext",
     dataset_path: Optional[str] = None,
+    dataset_hf_path: Optional[str] = None,
+    dataset_hf_config: str = "",
+    dataset_hf_split: str = "train",
+    dataset_streaming: bool = False,
     device: str = "cuda",
 ):
     """
@@ -915,7 +1030,17 @@ def umap_layerwise_init(
     print("UMAP Layer-wise Initialization")
     print("=" * 60)
 
+    dataset_name = str(dataset_name or "")
     dataset_path = str(dataset_path or dataset_name)
+    dataset_hf_path = str(dataset_hf_path or "")
+    dataset_fp = _dataset_fingerprint(
+        dataset_name=dataset_name,
+        dataset_path=dataset_path,
+        dataset_hf_path=dataset_hf_path,
+        dataset_hf_config=dataset_hf_config,
+        dataset_hf_split=dataset_hf_split,
+        dataset_streaming=bool(dataset_streaming),
+    )
 
     # Determine student hidden size early (needed for cache key)
     if hidden_size is None:
@@ -940,6 +1065,7 @@ def umap_layerwise_init(
         init_cosine_loss_weight,
         init_max_grad_norm,
         init_warmup_fraction,
+        dataset_fingerprint=dataset_fp,
     )
     student_cache_path = Path(cache_dir) / student_key
     student_marker = student_cache_path / "done.marker"
@@ -965,6 +1091,10 @@ def umap_layerwise_init(
         device,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
+        dataset_hf_path=dataset_hf_path,
+        dataset_hf_config=dataset_hf_config,
+        dataset_hf_split=dataset_hf_split,
+        dataset_streaming=bool(dataset_streaming),
     )
 
     # Step 2: UMAP reduce all layers + embeddings

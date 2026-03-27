@@ -66,6 +66,7 @@ BOOL_COLUMNS = {
     "distillation_teacher_fp16",
     "train_bf16",
     "train_fp16",
+    "data_streaming",
 }
 
 INT_COLUMNS = {
@@ -101,8 +102,15 @@ DISTILL_RUNTIME_COLUMN_MAP = [
     ("student_hidden_size", "distillation.student.hidden_size"),
     ("tokenizer_chunk_length", "tokenizer.chunk_length"),
     ("data_input_path", "data.input_path"),
+    ("data_hf_path", "data.hf_path"),
+    ("data_hf_config", "data.hf_config"),
+    ("data_hf_train_split", "data.hf_train_split"),
+    ("data_hf_eval_split", "data.hf_eval_split"),
+    ("data_streaming", "data.streaming"),
+    ("data_prepared_path", "data.prepared_path"),
     ("data_prepared_dir", "data.prepared_dir"),
     ("data_prepared_split", "data.prepared_split"),
+    ("data_eval_prepared_path", "data.eval_prepared_path"),
     ("data_eval_prepared_dir", "data.eval_prepared_dir"),
     ("data_eval_prepared_split", "data.eval_prepared_split"),
     ("train_num_epochs", "model.train_args.num_train_epochs"),
